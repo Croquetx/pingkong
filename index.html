@@ -1,0 +1,821 @@
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+        <title>Croquet Ping Kong</title>
+        <style>
+            html, body {
+                margin: 0;
+                height: 100%;
+                overflow: hidden;
+                touch-action: none;
+                background: #333;
+                -webkit-touch-callout: none;
+                -webkit-user-select: none;
+                user-select: none;
+                touch-action: none;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
+            #canvas {
+                background: #000;
+                object-fit: contain;
+                max-width: 100%;
+                max-height: 100%;
+            }
+            #codelink {
+                position: fixed; bottom: 10px; right: 10px; padding: .5em; border-radius: 30px;
+                opacity: 50%; background: lightgray; box-shadow: 1px 1px 5px black;
+                text-decoration: none; font-family: monospace; font-size: 1.5em;
+            }
+            #codelink:hover {
+                opacity: 100%;
+            }
+            #sound-bounce {
+                display: none;
+            }
+            #sound-score {
+                display: none;
+            }
+        </style>
+        <script src="https://cdn.jsdelivr.net/npm/@croquet/croquet@1.1.0"></script>
+    </head>
+    <body>
+        <canvas id="canvas" width="900" height="600"></canvas>
+        <a id="codelink" href="https://github.com/croquet/pingkong/blob/main/index.html"
+            title="View source code on GitHub" target="_blank">{}</a>
+        <script>
+            // Create simple sounds using the Web Audio API
+            window.addEventListener('DOMContentLoaded', () => {
+                // We'll create our sounds when user interacts with the page
+                document.addEventListener('click', initAudio, {once: true});
+                
+                function initAudio() {
+                    // Create audio context
+                    window.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    console.log("Audio context initialized");
+                }
+            });
+            
+            // Function to play a simple sine wave tone
+            function playTone(frequency, duration, volume) {
+                if (!window.audioContext) return;
+                
+                try {
+                    const oscillator = audioContext.createOscillator();
+                    const gainNode = audioContext.createGain();
+                    
+                    oscillator.type = 'sine';
+                    oscillator.frequency.value = frequency;
+                    
+                    gainNode.gain.value = volume;
+                    
+                    oscillator.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+                    
+                    oscillator.start();
+                    oscillator.stop(audioContext.currentTime + duration);
+                    
+                    console.log(`Playing tone: ${frequency}Hz, ${duration}s, volume ${volume}`);
+                } catch (e) {
+                    console.error("Error playing tone:", e);
+                }
+            }
+        </script>
+        <script>
+/////////// Model code is executed inside of synced VM ///////////
+
+class Game extends Croquet.Model {
+    init(_, persisted) {
+        this.players = new Map();
+        this.spectators = [];
+        this.scores = [0, 0];
+        this.gameState = "waiting"; // waiting, playing, over
+        this.winningScore = 10;
+        this.width = 900;
+        this.height = 600;
+        this.paddleWidth = 10;
+        this.paddleHeight = 100;
+        this.paddleOffset = 30;
+        this.paddleSpeed = 10;
+        this.ballRadius = 10;
+        this.ballSpeedMin = 5;
+        this.ballSpeedIncrement = 0.05;
+        
+        // Ball state
+        this.ball = {
+            x: this.width / 2,
+            y: this.height / 2,
+            dx: 0,
+            dy: 0,
+            speed: this.ballSpeedMin
+        };
+
+        // Paddle states (player 0 - left, player 1 - right)
+        this.paddles = [
+            {y: this.height / 2 - this.paddleHeight / 2, dy: 0},
+            {y: this.height / 2 - this.paddleHeight / 2, dy: 0}
+        ];
+
+        this.subscribe(this.sessionId, "view-join", this.viewJoined);
+        this.subscribe(this.sessionId, "view-exit", this.viewExited);
+        this.subscribe(this.id, "start-game", this.startGame);
+        this.subscribe(this.id, "paddle-move", this.paddleMove);
+    }
+
+    viewJoined(viewId) {
+        if (this.players.size < 2) {
+            // Assign player to left (0) or right (1) side
+            const playerIndex = this.players.size;
+            this.players.set(viewId, playerIndex);
+            this.publish(this.sessionId, "player-joined", {viewId, playerIndex});
+            
+            if (this.players.size === 2 && this.gameState === "waiting") {
+                // Enable new game button for all players when second player joins
+                this.publish(this.sessionId, "enable-new-game");
+                
+                // Also send direct messages to each player to ensure both receive it
+                for (const playerId of this.players.keys()) {
+                    this.publish(playerId, "enable-new-game");
+                }
+            }
+        } else {
+            // Add as spectator
+            this.spectators.push(viewId);
+            this.publish(this.sessionId, "spectator-joined", {viewId});
+        }
+    }
+
+    viewExited(viewId) {
+        if (this.players.has(viewId)) {
+            const playerIndex = this.players.get(viewId);
+            this.players.delete(viewId);
+            
+            // Handle player leaving during game
+            if (this.gameState === "playing") {
+                this.gameState = "waiting";
+                this.publish(this.sessionId, "player-left", {playerIndex});
+            }
+            
+            // Promote first spectator to player if available
+            if (this.spectators.length > 0) {
+                const newPlayerId = this.spectators.shift();
+                this.players.set(newPlayerId, playerIndex);
+                this.publish(this.sessionId, "player-promoted", {viewId: newPlayerId, playerIndex});
+            }
+        } else {
+            // Remove from spectators if present
+            const spectatorIndex = this.spectators.indexOf(viewId);
+            if (spectatorIndex >= 0) {
+                this.spectators.splice(spectatorIndex, 1);
+            }
+        }
+    }
+
+    startGame() {
+        if (this.players.size < 2 || this.gameState === "playing") return;
+        
+        this.gameState = "playing";
+        this.scores = [0, 0];
+        this.resetBall();
+        this.publish(this.sessionId, "game-started");
+        this.step();
+    }
+
+    resetBall() {
+        this.ball.x = this.width / 2;
+        this.ball.y = this.height / 2;
+        this.ball.speed = this.ballSpeedMin;
+        
+        // Set random direction, slightly favoring horizontal over vertical
+        const angle = (Math.random() * Math.PI / 4) - (Math.PI / 8) + 
+                     (Math.random() < 0.5 ? 0 : Math.PI);
+        this.ball.dx = Math.cos(angle) * this.ball.speed;
+        this.ball.dy = Math.sin(angle) * this.ball.speed;
+    }
+
+    paddleMove(data) {
+        const {viewId, direction, position} = data;
+        if (!this.players.has(viewId)) return;
+        
+        const playerIndex = this.players.get(viewId);
+        const paddle = this.paddles[playerIndex];
+        
+        // If position is provided, directly set paddle position
+        if (position !== undefined) {
+            paddle.y = Math.max(0, Math.min(this.height - this.paddleHeight, position));
+            return;
+        }
+        
+        // Otherwise use direction for keyboard controls
+        paddle.dy = direction * this.paddleSpeed;
+        
+        // If game is not playing, immediately update paddle position for testing
+        if (this.gameState !== "playing") {
+            paddle.y += paddle.dy;
+            
+            // Constrain paddles to screen
+            if (paddle.y < 0) {
+                paddle.y = 0;
+            }
+            if (paddle.y > this.height - this.paddleHeight) {
+                paddle.y = this.height - this.paddleHeight;
+            }
+            
+            // Reset paddle velocity if not in game
+            paddle.dy = 0;
+        }
+    }
+
+    step() {
+        if (this.gameState !== "playing") return;
+        
+        // Move paddles based on their velocity
+        for (let i = 0; i < this.paddles.length; i++) {
+            const paddle = this.paddles[i];
+            
+            // Apply paddle movement
+            if (paddle.dy !== 0) {
+                paddle.y += paddle.dy;
+                
+                // Constrain paddles to screen
+                if (paddle.y < 0) {
+                    paddle.y = 0;
+                }
+                if (paddle.y > this.height - this.paddleHeight) {
+                    paddle.y = this.height - this.paddleHeight;
+                }
+            }
+        }
+        
+        // Move ball
+        this.ball.x += this.ball.dx;
+        this.ball.y += this.ball.dy;
+        
+        // Check for collisions
+        this.checkCollisions();
+        
+        // Schedule next step
+        this.future(16).step();
+    }
+
+    checkCollisions() {
+        // Check top/bottom walls
+        if (this.ball.y - this.ballRadius < 0 || 
+            this.ball.y + this.ballRadius > this.height) {
+            this.ball.dy = -this.ball.dy;
+            this.publish(this.sessionId, "ball-bounce", {type: "wall"});
+            
+            // Constrain ball position
+            if (this.ball.y < this.ballRadius) this.ball.y = this.ballRadius;
+            if (this.ball.y > this.height - this.ballRadius) {
+                this.ball.y = this.height - this.ballRadius;
+            }
+        }
+        
+        // Check paddles
+        for (let i = 0; i < 2; i++) {
+            const paddle = this.paddles[i];
+            const paddleX = i === 0 ? this.paddleOffset : this.width - this.paddleOffset - this.paddleWidth;
+            
+            // Check if ball is at the right x-coordinate for this paddle
+            if ((i === 0 && this.ball.dx < 0 && this.ball.x - this.ballRadius <= paddleX + this.paddleWidth && 
+                 this.ball.x + this.ballRadius >= paddleX) || 
+                (i === 1 && this.ball.dx > 0 && this.ball.x + this.ballRadius >= paddleX && 
+                 this.ball.x - this.ballRadius <= paddleX + this.paddleWidth)) {
+                
+                // Check if ball is at the right y-coordinate
+                if (this.ball.y >= paddle.y - this.ballRadius && 
+                    this.ball.y <= paddle.y + this.paddleHeight + this.ballRadius) {
+                    
+                    // Determine where on the paddle the ball hit (normalized from -1 to 1)
+                    const hitPos = (this.ball.y - (paddle.y + this.paddleHeight / 2)) / (this.paddleHeight / 2);
+                    
+                    // Reflect with angle based on where ball hit the paddle
+                    this.ball.dx = -this.ball.dx;
+                    
+                    // Add some randomness to the bounce
+                    const angleAdjust = Math.PI/6 * hitPos; // Up to 30 degrees deflection
+                    const speed = Math.sqrt(this.ball.dx * this.ball.dx + this.ball.dy * this.ball.dy);
+                    
+                    // Calculate new direction
+                    const angle = Math.atan2(this.ball.dy, this.ball.dx) + angleAdjust;
+                    
+                    // Add paddle's motion to the ball
+                    this.ball.dy += paddle.dy * 0.3;
+                    
+                    // Increase ball speed slightly with each hit
+                    const newSpeed = speed + this.ballSpeedIncrement;
+                    
+                    // Set new velocity
+                    this.ball.dx = Math.cos(angle) * newSpeed;
+                    this.ball.dy = Math.sin(angle) * newSpeed;
+                    
+                    // Ensure the ball always moves toward the opposite player
+                    // with a minimum horizontal velocity (40% of total speed)
+                    const minHorizontalSpeed = newSpeed * 0.4;
+                    
+                    // Enforce direction based on which paddle hit the ball
+                    if (i === 0 && this.ball.dx < 0) {
+                        // Left paddle hit, ball must go right
+                        this.ball.dx = -this.ball.dx;
+                    } else if (i === 1 && this.ball.dx > 0) {
+                        // Right paddle hit, ball must go left
+                        this.ball.dx = -this.ball.dx;
+                    }
+                    
+                    // Ensure minimum horizontal speed while preserving direction
+                    if (Math.abs(this.ball.dx) < minHorizontalSpeed) {
+                        this.ball.dx = this.ball.dx > 0 ? minHorizontalSpeed : -minHorizontalSpeed;
+                        
+                        // Adjust vertical speed to maintain approximately the same total speed
+                        const newVerticalSpeed = Math.sqrt(newSpeed * newSpeed - this.ball.dx * this.ball.dx);
+                        this.ball.dy = this.ball.dy > 0 ? newVerticalSpeed : -newVerticalSpeed;
+                    }
+                    
+                    // Notify for sound effect
+                    this.publish(this.sessionId, "ball-bounce", {type: "paddle"});
+                    
+                    // Position ball correctly to prevent getting stuck in paddle
+                    if (i === 0) {
+                        this.ball.x = paddleX + this.paddleWidth + this.ballRadius;
+                    } else {
+                        this.ball.x = paddleX - this.ballRadius;
+                    }
+                }
+            }
+        }
+        
+        // Check scoring
+        if (this.ball.x < 0) {
+            // Right player scores
+            this.scores[1]++;
+            this.publish(this.sessionId, "score", {player: 1, scores: this.scores});
+            this.checkGameOver();
+        } else if (this.ball.x > this.width) {
+            // Left player scores
+            this.scores[0]++;
+            this.publish(this.sessionId, "score", {player: 0, scores: this.scores});
+            this.checkGameOver();
+        }
+    }
+
+    checkGameOver() {
+        if (this.scores[0] >= this.winningScore || this.scores[1] >= this.winningScore) {
+            this.gameState = "over";
+            const winner = this.scores[0] >= this.winningScore ? 0 : 1;
+            this.publish(this.sessionId, "game-over", {winner, scores: this.scores});
+            
+            // Handle player rotation
+            if (this.spectators.length > 0) {
+                // Determine which viewId corresponds to the loser
+                let loserId = null;
+                for (const [viewId, playerIndex] of this.players.entries()) {
+                    if (playerIndex !== winner) {
+                        loserId = viewId;
+                        break;
+                    }
+                }
+                
+                if (loserId) {
+                    // Remove loser from players
+                    this.players.delete(loserId);
+                    
+                    // Add next spectator as player
+                    const newPlayerId = this.spectators.shift();
+                    const loserIndex = winner === 0 ? 1 : 0;
+                    this.players.set(newPlayerId, loserIndex);
+                    
+                    // Add former player as spectator
+                    this.spectators.push(loserId);
+                    
+                    // Notify views
+                    this.publish(this.sessionId, "players-rotated", {
+                        newPlayer: newPlayerId, 
+                        formerPlayer: loserId,
+                        playerIndex: loserIndex
+                    });
+                }
+            }
+            
+            // Return to waiting state
+            this.gameState = "waiting";
+            this.publish(this.sessionId, "enable-new-game");
+        } else {
+            // Continue game with reset ball
+            this.resetBall();
+        }
+    }
+}
+Game.register("Game");
+
+
+/////////// View code is executed outside of synced VM ///////////
+
+class GameView extends Croquet.View {
+    constructor(model) {
+        super(model);
+        this.model = model;
+        this.gameWidth = model.width;
+        this.gameHeight = model.height;
+        this.canvas = document.getElementById("canvas");
+        this.context = this.canvas.getContext("2d");
+        this.playerIndex = -1; // -1 means spectator
+        this.newGameButton = null;
+        this.winner = null;
+        
+        // Set up event listeners
+        this.subscribe(this.sessionId, "player-joined", this.onPlayerJoined);
+        this.subscribe(this.sessionId, "spectator-joined", this.onSpectatorJoined);
+        this.subscribe(this.sessionId, "player-left", this.onPlayerLeft);
+        this.subscribe(this.sessionId, "player-promoted", this.onPlayerPromoted);
+        this.subscribe(this.sessionId, "enable-new-game", this.onEnableNewGame);
+        this.subscribe(this.viewId, "enable-new-game", this.onEnableNewGame);
+        this.subscribe(this.sessionId, "game-started", this.onGameStarted);
+        this.subscribe(this.sessionId, "game-over", this.onGameOver);
+        this.subscribe(this.sessionId, "ball-bounce", this.onBallBounce);
+        this.subscribe(this.sessionId, "score", this.onScore);
+        this.subscribe(this.sessionId, "players-rotated", this.onPlayersRotated);
+        
+        // Check if we're actually a player (might have joined while page was refreshing)
+        for (const [viewId, playerIndex] of model.players.entries()) {
+            if (viewId === this.viewId) {
+                this.playerIndex = playerIndex;
+                console.log("Initialized as player", this.playerIndex + 1);
+                break;
+            }
+        }
+        
+        // Set up paddle controls
+        this.setupControls();
+        
+        // Create the new game button
+        this.createNewGameButton();
+        
+        // Start rendering
+        this.animationFrameRequest = null;
+        this.startRendering();
+        
+        // Immediately check if the button should be enabled
+        // This will enable it for the second player immediately upon joining
+        if (model.players.size === 2 && model.gameState === "waiting") {
+            setTimeout(() => this.onEnableNewGame(), 100);
+        }
+        
+        // Initialize audio context if possible
+        this.initAudio();
+    }
+    
+    detach() {
+        if (this.animationFrameRequest) {
+            cancelAnimationFrame(this.animationFrameRequest);
+            this.animationFrameRequest = null;
+        }
+        super.detach();
+    }
+    
+    startRendering() {
+        const renderFrame = () => {
+            this.update();
+            this.animationFrameRequest = requestAnimationFrame(renderFrame);
+        };
+        this.animationFrameRequest = requestAnimationFrame(renderFrame);
+    }
+    
+    setupControls() {
+        // Track key states to handle multiple keys pressed at once
+        const keyState = {
+            up: false,
+            down: false
+        };
+        
+        const updatePaddleDirection = () => {
+            if (this.playerIndex === -1) return;
+            
+            let direction = 0;
+            if (keyState.up && !keyState.down) {
+                direction = -1;
+            } else if (!keyState.up && keyState.down) {
+                direction = 1;
+            }
+            
+            this.publish(this.model.id, "paddle-move", {
+                viewId: this.viewId,
+                direction: direction
+            });
+        };
+        
+        document.onkeydown = (e) => {
+            if (this.playerIndex === -1) return; // Spectators don't control paddles
+            
+            const key = e.key.toLowerCase();
+            
+            if (key === 'w' || key === 'a' || key === 'arrowup' || key === 'arrowleft') {
+                keyState.up = true;
+                e.preventDefault(); // Prevent page scrolling
+            } else if (key === 's' || key === 'd' || key === 'arrowdown' || key === 'arrowright') {
+                keyState.down = true;
+                e.preventDefault(); // Prevent page scrolling
+            }
+            
+            updatePaddleDirection();
+        };
+        
+        document.onkeyup = (e) => {
+            if (this.playerIndex === -1) return;
+            
+            const key = e.key.toLowerCase();
+            
+            if (key === 'w' || key === 'a' || key === 'arrowup' || key === 'arrowleft') {
+                keyState.up = false;
+            } else if (key === 's' || key === 'd' || key === 'arrowdown' || key === 'arrowright') {
+                keyState.down = false;
+            }
+            
+            updatePaddleDirection();
+        };
+        
+        // For mouse/touch, track direct position instead of direction
+        const getCanvasY = (clientY) => {
+            const rect = this.canvas.getBoundingClientRect();
+            const scale = this.gameHeight / rect.height;
+            return (clientY - rect.top) * scale;
+        };
+        
+        let isDragging = false;
+        
+        this.canvas.onpointerdown = (e) => {
+            if (this.playerIndex === -1) return;
+            
+            isDragging = true;
+            
+            // Get the canvas-relative Y position and adjust for paddle height
+            const paddleY = getCanvasY(e.clientY) - (this.model.paddleHeight / 2);
+            
+            this.publish(this.model.id, "paddle-move", {
+                viewId: this.viewId,
+                position: paddleY
+            });
+            
+            e.preventDefault(); // Prevent default behaviors
+        };
+        
+        document.onpointermove = (e) => {
+            if (!isDragging || this.playerIndex === -1) return;
+            
+            // Get the canvas-relative Y position and adjust for paddle height
+            const paddleY = getCanvasY(e.clientY) - (this.model.paddleHeight / 2);
+            
+            this.publish(this.model.id, "paddle-move", {
+                viewId: this.viewId,
+                position: paddleY
+            });
+        };
+        
+        document.onpointerup = () => {
+            isDragging = false;
+            // Don't reset paddle position when releasing
+        };
+        
+        document.onpointercancel = document.onpointerup;
+        
+        // Reset input when window loses focus
+        window.onblur = () => {
+            keyState.up = false;
+            keyState.down = false;
+            updatePaddleDirection();
+            isDragging = false;
+        };
+    }
+    
+    createNewGameButton() {
+        // Create button if it doesn't exist
+        if (!this.newGameButton) {
+            this.newGameButton = document.createElement("button");
+            this.newGameButton.textContent = "New Game";
+            this.newGameButton.style.position = "absolute";
+            this.newGameButton.style.top = "50%";
+            this.newGameButton.style.left = "50%";
+            this.newGameButton.style.transform = "translate(-50%, -50%)";
+            this.newGameButton.style.padding = "10px 20px";
+            this.newGameButton.style.fontSize = "20px";
+            this.newGameButton.style.backgroundColor = "#666";
+            this.newGameButton.style.color = "#CCC";
+            this.newGameButton.style.border = "none";
+            this.newGameButton.style.borderRadius = "5px";
+            this.newGameButton.style.cursor = "default";
+            this.newGameButton.disabled = true;
+            
+            this.newGameButton.onclick = () => {
+                if (!this.newGameButton.disabled) {
+                    this.publish(this.model.id, "start-game");
+                }
+            };
+            
+            document.body.appendChild(this.newGameButton);
+        }
+    }
+    
+    onPlayerJoined(data) {
+        if (data.viewId === this.viewId) {
+            this.playerIndex = data.playerIndex;
+            console.log("Player joined as player", this.playerIndex + 1);
+            // If we join as the second player and game is in waiting state, enable the button
+            if (this.model.players.size === 2 && this.model.gameState === "waiting") {
+                this.onEnableNewGame();
+            }
+        }
+    }
+    
+    onSpectatorJoined(data) {
+        if (data.viewId === this.viewId) {
+            this.playerIndex = -1;
+        }
+    }
+    
+    onPlayerLeft(data) {
+        // Handle player leaving game
+    }
+    
+    onPlayerPromoted(data) {
+        if (data.viewId === this.viewId) {
+            this.playerIndex = data.playerIndex;
+            console.log("Promoted to player", this.playerIndex + 1);
+            
+            // Ensure button is enabled if we should be able to start a game
+            if (this.model.players.size === 2 && this.model.gameState === "waiting") {
+                this.onEnableNewGame();
+            }
+        }
+    }
+    
+    onEnableNewGame() {
+        if (this.newGameButton) {
+            // Only enable the button for players, not spectators
+            if (this.playerIndex >= 0) {
+                this.newGameButton.disabled = false;
+                this.newGameButton.style.backgroundColor = "#4CAF50";
+                this.newGameButton.style.color = "white";
+                this.newGameButton.style.cursor = "pointer";
+            } else {
+                // For spectators, keep the button disabled
+                this.newGameButton.disabled = true;
+                this.newGameButton.style.backgroundColor = "#666";
+                this.newGameButton.style.color = "#CCC";
+                this.newGameButton.style.cursor = "default";
+            }
+        }
+    }
+    
+    onGameStarted() {
+        // Hide the new game button
+        this.newGameButton.style.display = "none";
+    }
+    
+    onGameOver(data) {
+        // Show the new game button
+        this.newGameButton.style.display = "block";
+        this.winner = data.winner;
+    }
+    
+    onBallBounce(data) {
+        try {
+            // Play a simple tone for bounce
+            if (data.type === "paddle") {
+                // Higher pitch for paddle hits (C note)
+                playTone(523.25, 0.1, 0.5);
+            } else {
+                // Lower pitch for wall hits (G note)
+                playTone(392.00, 0.1, 0.3);
+            }
+        } catch (e) {
+            console.log("Sound play error:", e);
+        }
+    }
+    
+    onScore(data) {
+        try {
+            // Play ascending notes for score
+            playTone(523.25, 0.15, 0.6); // C5
+            setTimeout(() => playTone(659.25, 0.15, 0.6), 150); // E5
+            setTimeout(() => playTone(783.99, 0.3, 0.7), 300); // G5
+        } catch (e) {
+            console.log("Sound play error:", e);
+        }
+    }
+    
+    onPlayersRotated(data) {
+        if (data.newPlayer === this.viewId) {
+            this.playerIndex = data.playerIndex;
+        } else if (data.formerPlayer === this.viewId) {
+            this.playerIndex = -1;
+        }
+    }
+    
+    update() {
+        // Clear the canvas
+        this.context.clearRect(0, 0, this.gameWidth, this.gameHeight);
+        
+        // Draw background
+        this.context.fillStyle = "black";
+        this.context.fillRect(0, 0, this.gameWidth, this.gameHeight);
+        
+        // Draw center line
+        this.context.strokeStyle = "white";
+        this.context.lineWidth = 2;
+        this.context.setLineDash([10, 15]);
+        this.context.beginPath();
+        this.context.moveTo(this.gameWidth / 2, 0);
+        this.context.lineTo(this.gameWidth / 2, this.gameHeight);
+        this.context.stroke();
+        this.context.setLineDash([]);
+        
+        // Draw scores
+        this.context.fillStyle = "white";
+        this.context.font = "60px Arial";
+        this.context.textAlign = "center";
+        this.context.fillText(this.model.scores[0].toString(), this.gameWidth * 0.25, 80);
+        this.context.fillText(this.model.scores[1].toString(), this.gameWidth * 0.75, 80);
+        
+        // Check if we need to redetermine player status
+        if (this.playerIndex === -1) {
+            // Double-check if we're actually a player
+            for (const [viewId, playerIndex] of this.model.players.entries()) {
+                if (viewId === this.viewId) {
+                    this.playerIndex = playerIndex;
+                    console.log("Fixed player status to player", this.playerIndex + 1);
+                    break;
+                }
+            }
+        }
+        
+        // Draw paddles
+        this.context.fillStyle = "white";
+        for (let i = 0; i < 2; i++) {
+            const paddle = this.model.paddles[i];
+            const x = i === 0 ? this.model.paddleOffset : 
+                                this.gameWidth - this.model.paddleOffset - this.model.paddleWidth;
+            
+            // Highlight the player's paddle
+            if (i === this.playerIndex) {
+                this.context.fillStyle = "#4CAF50";
+            } else {
+                this.context.fillStyle = "white";
+            }
+            
+            this.context.fillRect(x, paddle.y, this.model.paddleWidth, this.model.paddleHeight);
+        }
+        
+        // Draw ball
+        this.context.fillStyle = "white";
+        this.context.beginPath();
+        this.context.arc(this.model.ball.x, this.model.ball.y, this.model.ballRadius, 0, Math.PI * 2);
+        this.context.fill();
+        
+        // Draw player status
+        this.context.font = "16px Arial";
+        this.context.textAlign = "left";
+        this.context.fillStyle = "white";
+        
+        if (this.playerIndex === -1) {
+            this.context.fillText("You are spectating", 10, this.gameHeight - 10);
+        } else {
+            this.context.fillText(`You are Player ${this.playerIndex + 1}`, 10, this.gameHeight - 10);
+        }
+        
+        // Draw waiting message or game over message
+        this.context.font = "24px Arial";
+        this.context.textAlign = "center";
+        if (this.model.gameState === "waiting" && this.model.players.size < 2) {
+            this.context.fillText("Waiting for second player...", this.gameWidth / 2, this.gameHeight / 2 - 40);
+        } else if (this.model.gameState === "waiting" && this.winner !== null) {
+            this.context.fillText(`Player ${this.winner + 1} wins!`, this.gameWidth / 2, this.gameHeight / 2 - 40);
+        }
+    }
+    
+    // Initialize audio context
+    initAudio() {
+        try {
+            // Create audio context immediately if possible
+            window.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            console.log("Audio context initialized on startup");
+        } catch (e) {
+            console.log("Audio context initialization deferred to user interaction");
+        }
+    }
+}
+
+Croquet.App.makeWidgetDock(); // shows QR code
+
+Croquet.Session.join({
+    apiKey: '1_i65fcn11n7lhrb5n890hs3dhj11hfzfej57pvlrx',
+    appId: 'io.croquet.pingkong',
+    name: Croquet.App.autoSession(),
+    password: Croquet.App.autoPassword(),
+    model: Game,
+    view: GameView,
+});
+        </script>
+    </body>
+</html>
