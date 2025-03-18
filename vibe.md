@@ -25,7 +25,7 @@ Spectators queue to play the winner after game ends
 Losing player becomes a spectator
 The game is ready to play. Just open index.html in a browser, and share the URL (or scan the QR code that appears) to allow others to join. The game will automatically connect players and implement the player rotation system as described.*
 
-**David:** This is excellent. The keyboard and the mouse controls are now working. I can't control the paddles up or down. Also, when a second user joins, the New Game button turns green and is ready to press, but the new player's New Game button is still gray.
+**David:** This is excellent. The keyboard and the mouse controls are not working. I can't control the paddles up or down. Also, when a second user joins, the New Game button turns green and is ready to press, but the new player's New Game button is still gray.
 
 **Claude:** *I see the issues. Let's fix the paddle movement controls and ensure the New Game button properly enables for both players.
 Let's make a few more improvements to ensure the controls and button functionality work properly:
