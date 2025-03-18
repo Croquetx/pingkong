@@ -107,10 +107,9 @@ Added a small timeout to ensure the button has been created before enabling it
 In the onPlayerJoined method:
 Added code to enable the button if the player joins as the second player
 Added a subscription to the player-specific "enable-new-game" event
-All of these changes ensure that the New Game button turns green and becomes clickable for both players as soon as the second player joins. This addresses the issue you encountered where the second player's button remained gray.
-This is great.*
+All of these changes ensure that the New Game button turns green and becomes clickable for both players as soon as the second player joins. This addresses the issue you encountered where the second player's button remained gray.*
 
-**David:** Unfortunately, the players can't contol the paddles - neither the keyboard or mouse seem to be able to control them. They should move up and down when we press the appropriate keys or move the mouse.
+**David:** This is great. Unfortunately, the players can't contol the paddles - neither the keyboard or mouse seem to be able to control them. They should move up and down when we press the appropriate keys or move the mouse.
 
 **Claude:** *Let's fix the paddle movement issue. I'll create an updated version that ensures the controls work properly:
 The controls code looks good, but let's update the paddle movement handling in the Game model to make sure it properly applies the movement:
