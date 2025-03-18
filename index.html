@@ -112,12 +112,26 @@ class Game extends Croquet.Model {
             speed: this.ballSpeedMin
         };
 
-        // Paddle states (player 0 - left, player 1 - right)
+        // Paddle states with improved properties for smoother movement
         this.paddles = [
-            {y: this.height / 2 - this.paddleHeight / 2, dy: 0},
-            {y: this.height / 2 - this.paddleHeight / 2, dy: 0}
+            {
+                y: this.height / 2 - this.paddleHeight / 2, 
+                dy: 0,
+                targetY: this.height / 2 - this.paddleHeight / 2, // Target position for smooth interpolation
+                lastMoveTime: this.now() // Time of last movement command
+            },
+            {
+                y: this.height / 2 - this.paddleHeight / 2, 
+                dy: 0,
+                targetY: this.height / 2 - this.paddleHeight / 2,
+                lastMoveTime: this.now()
+            }
         ];
 
+        // Add paddle smoothness factor - higher means smoother but less responsive
+        this.paddleSmoothness = 0.7; // Value between 0 and 1
+        this.paddleMaxSpeed = 15; // Maximum speed paddles can move in pixels per frame
+        
         this.subscribe(this.sessionId, "view-join", this.viewJoined);
         this.subscribe(this.sessionId, "view-exit", this.viewExited);
         this.subscribe(this.id, "start-game", this.startGame);
@@ -202,14 +216,35 @@ class Game extends Croquet.Model {
         const playerIndex = this.players.get(viewId);
         const paddle = this.paddles[playerIndex];
         
-        // If position is provided, directly set paddle position
+        // Record the time of this movement command
+        paddle.lastMoveTime = this.now();
+        
+        // If position is provided, set target position for smooth interpolation
         if (position !== undefined) {
-            paddle.y = Math.max(0, Math.min(this.height - this.paddleHeight, position));
+            paddle.targetY = Math.max(0, Math.min(this.height - this.paddleHeight, position));
+            
+            // Set initial velocity for prediction
+            const distance = paddle.targetY - paddle.y;
+            paddle.dy = Math.sign(distance) * Math.min(Math.abs(distance) / 5, this.paddleMaxSpeed);
+            
+            // Immediate partial movement for responsiveness
+            if (this.gameState === "waiting") {
+                // Move the paddle directly in waiting state for better responsiveness
+                paddle.y = paddle.targetY;
+                paddle.dy = 0;
+            }
             return;
         }
         
         // Otherwise use direction for keyboard controls
         paddle.dy = direction * this.paddleSpeed;
+        
+        // For keyboard controls, immediately set target position
+        if (direction !== 0) {
+            paddle.targetY = direction > 0 ? 
+                Math.min(paddle.y + this.paddleHeight * 2, this.height - this.paddleHeight) :
+                Math.max(paddle.y - this.paddleHeight * 2, 0);
+        }
         
         // If game is not playing, immediately update paddle position for testing
         if (this.gameState !== "playing") {
@@ -223,6 +258,9 @@ class Game extends Croquet.Model {
                 paddle.y = this.height - this.paddleHeight;
             }
             
+            // Sync target position
+            paddle.targetY = paddle.y;
+            
             // Reset paddle velocity if not in game
             paddle.dy = 0;
         }
@@ -231,21 +269,50 @@ class Game extends Croquet.Model {
     step() {
         if (this.gameState !== "playing") return;
         
-        // Move paddles based on their velocity
+        // Move paddles with smoothing and prediction
         for (let i = 0; i < this.paddles.length; i++) {
             const paddle = this.paddles[i];
             
-            // Apply paddle movement
-            if (paddle.dy !== 0) {
+            // Calculate time since last movement command
+            const timeSinceMove = this.now() - paddle.lastMoveTime;
+            
+            // Add predictive movement for low latency
+            if (timeSinceMove < 100) { // Apply prediction only for recent movements
+                // Move toward target with smooth interpolation
+                const distance = paddle.targetY - paddle.y;
+                
+                // If we're close to target, slow down for smooth arrival
+                const moveAmount = Math.abs(distance) < 10 ? 
+                    distance * (1 - this.paddleSmoothness) : 
+                    Math.sign(distance) * Math.min(Math.abs(distance) * (1 - this.paddleSmoothness), this.paddleMaxSpeed);
+                
+                // Apply the movement
+                paddle.y += moveAmount;
+                
+                // Update velocity for ball physics
+                paddle.dy = moveAmount;
+            } else if (paddle.dy !== 0) {
+                // Continue any keyboard-triggered movement
                 paddle.y += paddle.dy;
                 
-                // Constrain paddles to screen
-                if (paddle.y < 0) {
-                    paddle.y = 0;
+                // Check if we've reached or passed the target
+                if ((paddle.dy > 0 && paddle.y >= paddle.targetY) ||
+                    (paddle.dy < 0 && paddle.y <= paddle.targetY)) {
+                    paddle.y = paddle.targetY;
+                    paddle.dy = 0;
                 }
-                if (paddle.y > this.height - this.paddleHeight) {
-                    paddle.y = this.height - this.paddleHeight;
-                }
+            }
+            
+            // Constrain paddles to screen
+            if (paddle.y < 0) {
+                paddle.y = 0;
+                paddle.targetY = 0;
+                paddle.dy = 0;
+            }
+            if (paddle.y > this.height - this.paddleHeight) {
+                paddle.y = this.height - this.paddleHeight;
+                paddle.targetY = this.height - this.paddleHeight;
+                paddle.dy = 0;
             }
         }
         
@@ -425,6 +492,16 @@ class GameView extends Croquet.View {
         this.newGameButton = null;
         this.winner = null;
         
+        // Detect if we're on mobile
+        this.isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        
+        // Track last render time for smooth animation
+        this.lastRenderTime = performance.now();
+        
+        // For smooth local rendering
+        this.localPaddlePosition = null;
+        this.previousServerPosition = null;
+        
         // Set up event listeners
         this.subscribe(this.sessionId, "player-joined", this.onPlayerJoined);
         this.subscribe(this.sessionId, "spectator-joined", this.onSpectatorJoined);
@@ -490,6 +567,12 @@ class GameView extends Croquet.View {
             down: false
         };
         
+        // Track last touch/mouse position for smoother movement
+        let lastPointerY = null;
+        let lastUpdateTime = 0;
+        const updateThrottle = 10; // Update paddle position every 10ms at most
+        let requestId = null;
+        
         const updatePaddleDirection = () => {
             if (this.playerIndex === -1) return;
             
@@ -536,56 +619,179 @@ class GameView extends Croquet.View {
             updatePaddleDirection();
         };
         
-        // For mouse/touch, track direct position instead of direction
+        // Improved pointer position calculation with better scaling
         const getCanvasY = (clientY) => {
             const rect = this.canvas.getBoundingClientRect();
             const scale = this.gameHeight / rect.height;
             return (clientY - rect.top) * scale;
         };
         
-        let isDragging = false;
+        // Function to throttle paddle position updates for smoother movement
+        const throttledPositionUpdate = (y) => {
+            const now = Date.now();
+            if (now - lastUpdateTime >= updateThrottle) {
+                lastUpdateTime = now;
+                
+                // Get the canvas-relative Y position and adjust for paddle height
+                const paddleY = y - (this.model.paddleHeight / 2);
+                
+                this.publish(this.model.id, "paddle-move", {
+                    viewId: this.viewId,
+                    position: paddleY
+                });
+            } else if (!requestId) {
+                // If we're throttling, schedule an update for later
+                requestId = setTimeout(() => {
+                    requestId = null;
+                    if (lastPointerY !== null) {
+                        throttledPositionUpdate(lastPointerY);
+                    }
+                }, updateThrottle - (now - lastUpdateTime));
+            }
+        };
         
-        this.canvas.onpointerdown = (e) => {
+        // Handle both mouse and touch events with the same code using pointer events
+        this.canvas.addEventListener('pointerdown', (e) => {
             if (this.playerIndex === -1) return;
             
-            isDragging = true;
+            // Capture pointer to improve responsiveness
+            this.canvas.setPointerCapture(e.pointerId);
             
-            // Get the canvas-relative Y position and adjust for paddle height
-            const paddleY = getCanvasY(e.clientY) - (this.model.paddleHeight / 2);
+            // Get and store the Y position
+            lastPointerY = getCanvasY(e.clientY);
             
+            // Initial update without throttling for immediate response
+            const paddleY = lastPointerY - (this.model.paddleHeight / 2);
             this.publish(this.model.id, "paddle-move", {
                 viewId: this.viewId,
                 position: paddleY
             });
             
-            e.preventDefault(); // Prevent default behaviors
-        };
+            lastUpdateTime = Date.now();
+            e.preventDefault();
+        });
         
-        document.onpointermove = (e) => {
-            if (!isDragging || this.playerIndex === -1) return;
+        this.canvas.addEventListener('pointermove', (e) => {
+            if (this.playerIndex === -1 || lastPointerY === null) return;
             
-            // Get the canvas-relative Y position and adjust for paddle height
-            const paddleY = getCanvasY(e.clientY) - (this.model.paddleHeight / 2);
+            // Update the stored position
+            lastPointerY = getCanvasY(e.clientY);
             
-            this.publish(this.model.id, "paddle-move", {
-                viewId: this.viewId,
-                position: paddleY
+            // Use throttled updates for smoother movement
+            throttledPositionUpdate(lastPointerY);
+            
+            e.preventDefault();
+        });
+        
+        this.canvas.addEventListener('pointerup', (e) => {
+            if (e.pointerId && this.canvas.hasPointerCapture(e.pointerId)) {
+                this.canvas.releasePointerCapture(e.pointerId);
+            }
+            lastPointerY = null;
+            
+            // Clear any pending updates
+            if (requestId) {
+                clearTimeout(requestId);
+                requestId = null;
+            }
+        });
+        
+        this.canvas.addEventListener('pointercancel', (e) => {
+            if (e.pointerId && this.canvas.hasPointerCapture(e.pointerId)) {
+                this.canvas.releasePointerCapture(e.pointerId);
+            }
+            lastPointerY = null;
+            
+            // Clear any pending updates
+            if (requestId) {
+                clearTimeout(requestId);
+                requestId = null;
+            }
+        });
+        
+        // Handle touch events differently on mobile for better responsiveness
+        if ('ontouchstart' in window || this.isMobile) {
+            // Add touch-specific optimizations
+            this.canvas.addEventListener('touchstart', (e) => {
+                // Prevent scrolling/zooming while playing
+                e.preventDefault();
+                
+                if (this.playerIndex === -1) return;
+                
+                // Get the touch position
+                const touch = e.touches[0];
+                lastPointerY = getCanvasY(touch.clientY);
+                
+                // For immediate local feedback on mobile
+                this.localPaddlePosition = lastPointerY - (this.model.paddleHeight / 2);
+                
+                // Store the current server position before local prediction
+                this.previousServerPosition = this.model.paddles[this.playerIndex].y;
+                
+                // Send the position to the server
+                const paddleY = lastPointerY - (this.model.paddleHeight / 2);
+                this.publish(this.model.id, "paddle-move", {
+                    viewId: this.viewId,
+                    position: paddleY
+                });
+                
+                lastUpdateTime = Date.now();
+            }, { passive: false });
+            
+            this.canvas.addEventListener('touchmove', (e) => {
+                // Prevent scrolling/zooming while playing
+                e.preventDefault();
+                
+                if (this.playerIndex === -1) return;
+                
+                // Get the touch position
+                const touch = e.touches[0];
+                lastPointerY = getCanvasY(touch.clientY);
+                
+                // For immediate local feedback on mobile
+                this.localPaddlePosition = lastPointerY - (this.model.paddleHeight / 2);
+                
+                // Throttle updates to server using the existing throttling mechanism
+                throttledPositionUpdate(lastPointerY);
+            }, { passive: false });
+            
+            this.canvas.addEventListener('touchend', () => {
+                lastPointerY = null;
+                this.localPaddlePosition = null;
+                this.previousServerPosition = null;
+                
+                // Clear any pending updates
+                if (requestId) {
+                    clearTimeout(requestId);
+                    requestId = null;
+                }
             });
-        };
-        
-        document.onpointerup = () => {
-            isDragging = false;
-            // Don't reset paddle position when releasing
-        };
-        
-        document.onpointercancel = document.onpointerup;
+            
+            this.canvas.addEventListener('touchcancel', () => {
+                lastPointerY = null;
+                this.localPaddlePosition = null;
+                this.previousServerPosition = null;
+                
+                // Clear any pending updates
+                if (requestId) {
+                    clearTimeout(requestId);
+                    requestId = null;
+                }
+            });
+        }
         
         // Reset input when window loses focus
         window.onblur = () => {
             keyState.up = false;
             keyState.down = false;
             updatePaddleDirection();
-            isDragging = false;
+            lastPointerY = null;
+            
+            // Clear any pending updates
+            if (requestId) {
+                clearTimeout(requestId);
+                requestId = null;
+            }
         };
     }
     
@@ -714,6 +920,11 @@ class GameView extends Croquet.View {
     }
     
     update() {
+        // Calculate delta time for smooth animation
+        const now = performance.now();
+        const dt = (now - this.lastRenderTime) / 16.67; // Normalize to a 60fps time step
+        this.lastRenderTime = now;
+        
         // Clear the canvas
         this.context.clearRect(0, 0, this.gameWidth, this.gameHeight);
         
@@ -760,11 +971,25 @@ class GameView extends Croquet.View {
             // Highlight the player's paddle
             if (i === this.playerIndex) {
                 this.context.fillStyle = "#4CAF50";
+                
+                // For mobile: apply local position prediction for the player's paddle
+                if (this.localPaddlePosition !== null && this.isMobile) {
+                    // Draw local paddle with interpolation for smoother movement
+                    const y = this.localPaddlePosition;
+                    
+                    // Constrain to screen bounds
+                    const constrainedY = Math.max(0, Math.min(this.gameHeight - this.model.paddleHeight, y));
+                    
+                    // Draw the paddle at the locally predicted position for immediate feedback
+                    this.context.fillRect(x, constrainedY, this.model.paddleWidth, this.model.paddleHeight);
+                } else {
+                    // Draw the server-side paddle position
+                    this.context.fillRect(x, paddle.y, this.model.paddleWidth, this.model.paddleHeight);
+                }
             } else {
                 this.context.fillStyle = "white";
+                this.context.fillRect(x, paddle.y, this.model.paddleWidth, this.model.paddleHeight);
             }
-            
-            this.context.fillRect(x, paddle.y, this.model.paddleWidth, this.model.paddleHeight);
         }
         
         // Draw ball
